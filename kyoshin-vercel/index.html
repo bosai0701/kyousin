@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>強震モニタ可視化</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  background: black;
+}
+#map {
+  width: 100vw;
+  height: 100vh;
+}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+
+<script>
+const POINTS_URL =
+  "https://bosai0701.github.io/tesuto/intensity-points.json";
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://demotiles.maplibre.org/style.json',
+  center: [139, 36],
+  zoom: 4,
+  interactive: false
+});
+
+// 加速度 → 色（強震モニタ風）
+function accToColor(acc) {
+  if (acc < 1)   return '#001020';
+  if (acc < 5)   return '#0033aa';
+  if (acc < 20)  return '#00ffff';
+  if (acc < 80)  return '#ffff00';
+  if (acc < 150) return '#ff8800';
+  return '#ff0000';
+}
+
+let stations = [];
+
+// 観測点読み込み
+async function loadStations() {
+  const res = await fetch(POINTS_URL);
+  stations = await res.json();
+}
+
+// GeoJSON生成
+function buildGeoJSON(acc) {
+  return {
+    type: "FeatureCollection",
+    features: stations.map(s => ({
+      type: "Feature",
+      geometry: {
+        type: "Point",
+        coordinates: [s.lon, s.lat]
+      },
+      properties: {
+        color: accToColor(acc)
+      }
+    }))
+  };
+}
+
+async function update() {
+  const res = await fetch('/api/kyoshin?ts=' + Date.now());
+  const data = await res.json();
+
+  const geojson = buildGeoJSON(data.max_acc);
+
+  if (map.getSource('stations')) {
+    map.getSource('stations').setData(geojson);
+  } else {
+    map.addSource('stations', {
+      type: 'geojson',
+      data: geojson
+    });
+
+    map.addLayer({
+      id: 'stations',
+      type: 'circle',
+      source: 'stations',
+      paint: {
+        'circle-radius': 3,
+        'circle-color': ['get', 'color'],
+        'circle-opacity': 0.9
+      }
+    });
+  }
+}
+
+map.on('load', async () => {
+  await loadStations();
+  await update();
+  setInterval(update, 5000);
+});
+</script>
+
+</body>
+</html>
