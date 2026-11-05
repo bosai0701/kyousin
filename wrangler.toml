@@ -1,0 +1,11 @@
+name = "green-grass-374f"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+[[durable_objects.bindings]]
+name = "COLLECTOR"
+class_name = "Collector"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Collector"]
