@@ -284,11 +284,13 @@ export class Collector extends DurableObject {
 
   /* [type u8][画像時刻ms f64][幅 u16][高さ u16][flags u8]
      [観測点総数 u16][件数 u16][サーバー処理ms u16][閲覧数 u16]
-     続けて件数ぶん [index u16][有効 u8][r][g][b] (little endian) */
+     続けて件数ぶん
+     [index u16][有効 u8][r u8][g u8][b u8][スケール値 f32] (little endian)
+     スケール値 = 色を多項式補間で変換した値（手順④の結果） */
   buildFrame(indices, full, clients) {
     const count = indices.length;
 
-    const out = new Uint8Array(22 + count * 6);
+    const out = new Uint8Array(22 + count * 10);
     const dv = new DataView(out.buffer);
 
     dv.setUint8(0, 1);
@@ -307,14 +309,23 @@ export class Collector extends DurableObject {
       const i = indices[k];
       const key = this.prevKeys[i];
 
+      const r = (key >> 16) & 255;
+      const g = (key >> 8) & 255;
+      const b = key & 255;
+
+      /* ④ 色 → スケール値（多項式補間） */
+      const position = key ? colorToPosition(rgbToHSV(r, g, b)) : null;
+
       dv.setUint16(o, i, true);
 
-      out[o + 2] = key ? 1 : 0;
-      out[o + 3] = (key >> 16) & 255;
-      out[o + 4] = (key >> 8) & 255;
-      out[o + 5] = key & 255;
+      out[o + 2] = position === null ? 0 : 1;
+      out[o + 3] = r;
+      out[o + 4] = g;
+      out[o + 5] = b;
 
-      o += 6;
+      dv.setFloat32(o + 6, position === null ? 0 : position, true);
+
+      o += 10;
     }
 
     return out;
@@ -548,6 +559,92 @@ function preparePoints(recs) {
   }
 
   return result;
+}
+
+/* =====================================================
+   ④ 色 → スケール値
+   RGB → HSV → 区分的多項式補間
+   ===================================================== */
+
+function rgbToHSV(r, g, b) {
+  r /= 255;
+  g /= 255;
+  b /= 255;
+
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+
+  const delta = max - min;
+
+  let h = 0;
+  const v = max;
+
+  const s = max === 0 ? 0 : delta / max;
+
+  if (delta !== 0) {
+    if (max === r) {
+      h = (g - b) / delta;
+
+      if (g < b) {
+        h += 6;
+      }
+    } else if (max === g) {
+      h = (b - r) / delta + 2;
+    } else {
+      h = (r - g) / delta + 4;
+    }
+
+    h /= 6;
+  }
+
+  return { h, s, v };
+}
+
+function colorToPosition(hsv) {
+  const h = hsv.h;
+  const s = hsv.s;
+  const v = hsv.v;
+
+  if (!(v > 0.1 && s > 0.75)) {
+    return null;
+  }
+
+  let p = 0;
+
+  if (h > 0.1476) {
+    const h2 = h * h;
+    const h3 = h2 * h;
+    const h4 = h3 * h;
+    const h5 = h4 * h;
+    const h6 = h5 * h;
+
+    p =
+      280.31 * h6 -
+      916.05 * h5 +
+      1142.6 * h4 -
+      709.95 * h3 +
+      234.65 * h2 -
+      40.27 * h +
+      3.2217;
+  } else if (h > 0.001) {
+    const h2 = h * h;
+    const h3 = h2 * h;
+    const h4 = h3 * h;
+
+    p = 151.4 * h4 - 49.32 * h3 + 6.753 * h2 - 2.481 * h + 0.9033;
+  } else {
+    p = -0.005171 * v * v - 0.3282 * v + 1.2236;
+  }
+
+  if (p < 0) {
+    p = 0;
+  }
+
+  if (!Number.isFinite(p)) {
+    return null;
+  }
+
+  return p;
 }
 
 /* =====================================================
