@@ -34,7 +34,13 @@ const ALLOWED_ORIGINS = [];
 export default {
   async fetch(req, env) {
     if (req.headers.get("Upgrade") !== "websocket") {
-      return new Response("wss only", { status: 426 });
+      /* ブラウザで /status を開くと取得係の状態が見える（確認用） */
+      if (new URL(req.url).pathname === "/status") {
+        const id = env.COLLECTOR.idFromName("main");
+        return env.COLLECTOR.get(id).fetch(req);
+      }
+
+      return new Response("wss only (collector v2)", { status: 426 });
     }
 
     if (ALLOWED_ORIGINS.length) {
@@ -70,6 +76,34 @@ export class Collector extends DurableObject {
   }
 
   async fetch(req) {
+    if (req.headers.get("Upgrade") !== "websocket") {
+      const jst = this.lastMs
+        ? new Date(this.lastMs + 9 * 3600e3)
+            .toISOString()
+            .replace("T", " ")
+            .slice(0, 19) + " JST"
+        : null;
+
+      const alarm = await this.ctx.storage.getAlarm();
+
+      return new Response(
+        JSON.stringify(
+          {
+            version: "collector v2",
+            clients: this.ctx.getWebSockets().length,
+            stations: this.stations.length,
+            lastImage: jst,
+            serverMs: this.serverMs,
+            lastErr: this.lastErr,
+            alarmScheduled: alarm !== null,
+          },
+          null,
+          2
+        ),
+        { headers: { "content-type": "application/json; charset=utf-8" } }
+      );
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
