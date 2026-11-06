@@ -73,6 +73,10 @@ export class Collector extends DurableObject {
     this.lastMs = 0;
     this.serverMs = 0;
     this.lastErr = "";
+
+    this.alarmRuns = 0;
+    this.lastAlarmAt = 0;
+    this.lastStepMs = 0;
   }
 
   async fetch(req) {
@@ -94,8 +98,13 @@ export class Collector extends DurableObject {
             stations: this.stations.length,
             lastImage: jst,
             serverMs: this.serverMs,
+            lastStepMs: this.lastStepMs,
             lastErr: this.lastErr,
             alarmScheduled: alarm !== null,
+            alarmRuns: this.alarmRuns,
+            lastAlarmAgoSec: this.lastAlarmAt
+              ? Math.round((Date.now() - this.lastAlarmAt) / 100) / 10
+              : null,
           },
           null,
           2
@@ -141,7 +150,8 @@ export class Collector extends DurableObject {
   async ensureAlarm() {
     const current = await this.ctx.storage.getAlarm();
 
-    if (current === null) {
+    /* 予約が無い、または古いまま残っている時は張り直す */
+    if (current === null || current < Date.now() - 5000) {
       await this.ctx.storage.setAlarm(Date.now() + 50);
     }
   }
@@ -152,6 +162,12 @@ export class Collector extends DurableObject {
 
     /* 誰もいなければ止める */
     if (clients === 0) return;
+
+    /* 先に次回を予約する。処理の途中で落ちても取得が止まらない */
+    await this.ctx.storage.setAlarm(Date.now() + POLL_MS);
+
+    this.alarmRuns++;
+    this.lastAlarmAt = Date.now();
 
     const t0 = Date.now();
 
@@ -167,9 +183,7 @@ export class Collector extends DurableObject {
       }
     }
 
-    const wait = Math.max(100, POLL_MS - (Date.now() - t0));
-
-    await this.ctx.storage.setAlarm(Date.now() + wait);
+    this.lastStepMs = Date.now() - t0;
   }
 
   async step(clients) {
