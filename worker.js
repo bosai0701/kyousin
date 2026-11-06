@@ -16,7 +16,7 @@ const LATEST_URL =
 const POINTS_URL =
   "https://raw.githubusercontent.com/ingen084/kyoshin-monitor-observation-points/refs/heads/master/intensity-points.json";
 
-/* 取得間隔(ms)。500にすると反応は速いが、無料プランの1日10万リクエストを超えやすい */
+/* 取得間隔(ms) */
 const POLL_MS = 1000;
 
 /* 最新時刻の画像が無い時に遡る秒数 */
@@ -24,8 +24,21 @@ const FALLBACK_SECONDS = 3;
 
 const FETCH_TIMEOUT = 4500;
 
-/* 空なら全許可。自分のサイトだけにするなら ["https://あなたのサイト"] */
+/* 空なら全許可 */
 const ALLOWED_ORIGINS = [];
+
+/* =====================================================
+   JST時刻変換
+   ===================================================== */
+
+function formatJST(ms) {
+  if (!ms) return null;
+
+  return new Date(ms + 9 * 3600e3)
+    .toISOString()
+    .replace("T", " ")
+    .slice(0, 19) + " JST";
+}
 
 /* =====================================================
    入口
@@ -34,7 +47,6 @@ const ALLOWED_ORIGINS = [];
 export default {
   async fetch(req, env) {
     if (req.headers.get("Upgrade") !== "websocket") {
-      /* ブラウザで /status を開くと取得係の状態が見える（確認用） */
       if (new URL(req.url).pathname === "/status") {
         const id = env.COLLECTOR.idFromName("main");
         return env.COLLECTOR.get(id).fetch(req);
@@ -56,7 +68,7 @@ export default {
 };
 
 /* =====================================================
-   Durable Object（全員で共有する1つだけの取得係）
+   Durable Object
    ===================================================== */
 
 export class Collector extends DurableObject {
@@ -73,26 +85,92 @@ export class Collector extends DurableObject {
     this.lastMs = 0;
     this.serverMs = 0;
     this.lastErr = "";
+
+    /* 遅延調査用 */
+    this.latestMs = 0;
+    this.lastBroadcastMs = 0;
   }
 
   async fetch(req) {
     if (req.headers.get("Upgrade") !== "websocket") {
-      const jst = this.lastMs
-        ? new Date(this.lastMs + 9 * 3600e3)
-            .toISOString()
-            .replace("T", " ")
-            .slice(0, 19) + " JST"
-        : null;
+      const now = Date.now();
 
       const alarm = await this.ctx.storage.getAlarm();
+
+      const latestAgeMs = this.latestMs
+        ? now - this.latestMs
+        : null;
+
+      const imageAgeMs = this.lastMs
+        ? now - this.lastMs
+        : null;
+
+      const latestToImageMs =
+        this.latestMs && this.lastMs
+          ? this.latestMs - this.lastMs
+          : null;
+
+      const imageToBroadcastMs =
+        this.lastBroadcastMs && this.lastMs
+          ? this.lastBroadcastMs - this.lastMs
+          : null;
 
       return new Response(
         JSON.stringify(
           {
             version: "collector v2",
+
             clients: this.ctx.getWebSockets().length,
             stations: this.stations.length,
-            lastImage: jst,
+
+            /* =====================================
+               時刻情報
+               ===================================== */
+
+            currentTime: now,
+            currentTimeJST: formatJST(now),
+
+            latestMs: this.latestMs || null,
+            latestJST: formatJST(this.latestMs),
+
+            lastImageMs: this.lastMs || null,
+            lastImageJST: formatJST(this.lastMs),
+
+            lastBroadcastMs: this.lastBroadcastMs || null,
+            lastBroadcastJST: formatJST(this.lastBroadcastMs),
+
+            /* =====================================
+               遅延情報
+               ===================================== */
+
+            latestAgeMs,
+            latestAgeSeconds:
+              latestAgeMs !== null
+                ? Number((latestAgeMs / 1000).toFixed(3))
+                : null,
+
+            imageAgeMs,
+            imageAgeSeconds:
+              imageAgeMs !== null
+                ? Number((imageAgeMs / 1000).toFixed(3))
+                : null,
+
+            latestToImageMs,
+            latestToImageSeconds:
+              latestToImageMs !== null
+                ? Number((latestToImageMs / 1000).toFixed(3))
+                : null,
+
+            imageToBroadcastMs,
+            imageToBroadcastSeconds:
+              imageToBroadcastMs !== null
+                ? Number((imageToBroadcastMs / 1000).toFixed(3))
+                : null,
+
+            /* =====================================
+               処理・通信状態
+               ===================================== */
+
             serverMs: this.serverMs,
             lastErr: this.lastErr,
             alarmScheduled: alarm !== null,
@@ -100,7 +178,11 @@ export class Collector extends DurableObject {
           null,
           2
         ),
-        { headers: { "content-type": "application/json; charset=utf-8" } }
+        {
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+          },
+        }
       );
     }
 
@@ -121,7 +203,6 @@ export class Collector extends DurableObject {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /* クライアントのping。再起動後でも取得を再開させる */
   async webSocketMessage(ws, message) {
     await this.ensureAlarm();
   }
@@ -146,11 +227,13 @@ export class Collector extends DurableObject {
     }
   }
 
-  /* 1回のalarm = 新しい実行枠なので、サブリクエスト上限(50)にも当たらない */
+  /* =====================================================
+     定期取得
+     ===================================================== */
+
   async alarm() {
     const clients = this.ctx.getWebSockets().length;
 
-    /* 誰もいなければ止める */
     if (clients === 0) return;
 
     const t0 = Date.now();
@@ -172,10 +255,17 @@ export class Collector extends DurableObject {
     await this.ctx.storage.setAlarm(Date.now() + wait);
   }
 
+  /* =====================================================
+     取得・解析・配信
+     ===================================================== */
+
   async step(clients) {
     const t0 = Date.now();
 
     const latest = await this.fetchLatest();
+
+    /* latest.jsonの時刻を記録 */
+    this.latestMs = latest;
 
     if (latest <= this.lastMs) return;
 
@@ -216,11 +306,12 @@ export class Collector extends DurableObject {
 
     if (!img) {
       throw new Error(
-        "最新画像を取得できません。" + ((lastError && lastError.message) || "")
+        "最新画像を取得できません。" +
+        ((lastError && lastError.message) || "")
       );
     }
 
-    /* 画像サイズが変わった時(初回含む)は観測点を作り直し、全員に全データを送る */
+    /* 画像サイズ変更時は観測点を再構築 */
     let rebuilt = false;
 
     if (img.W !== this.w || img.H !== this.h || !this.stations.length) {
@@ -252,7 +343,12 @@ export class Collector extends DurableObject {
 
         if (ci !== img.trans && pal && ci * 3 + 2 < pal.length) {
           const o = ci * 3;
-          key = ((1 << 24) | (pal[o] << 16) | (pal[o + 1] << 8) | pal[o + 2]) >>> 0;
+
+          key =
+            ((1 << 24) |
+              (pal[o] << 16) |
+              (pal[o + 1] << 8) |
+              pal[o + 2]) >>> 0;
         }
       }
 
@@ -270,6 +366,9 @@ export class Collector extends DurableObject {
       : this.buildFrame(changed, false, clients);
 
     this.broadcastBinary(frame);
+
+    /* 実際に配信処理を行った時刻 */
+    this.lastBroadcastMs = Date.now();
   }
 
   fullIndices() {
@@ -282,9 +381,10 @@ export class Collector extends DurableObject {
     return out;
   }
 
-  /* [type u8][画像時刻ms f64][幅 u16][高さ u16][flags u8]
-     [観測点総数 u16][件数 u16][サーバー処理ms u16][閲覧数 u16]
-     続けて件数ぶん [index u16][有効 u8][r][g][b] (little endian) */
+  /* =====================================================
+     バイナリフレーム
+     ===================================================== */
+
   buildFrame(indices, full, clients) {
     const count = indices.length;
 
@@ -336,6 +436,10 @@ export class Collector extends DurableObject {
     }
   }
 
+  /* =====================================================
+     latest.json取得
+     ===================================================== */
+
   async fetchLatest() {
     const res = await fetch(LATEST_URL, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT),
@@ -357,6 +461,10 @@ export class Collector extends DurableObject {
 
     return findLatestTime(data);
   }
+
+  /* =====================================================
+     観測点取得
+     ===================================================== */
 
   async loadPoints() {
     if (this.points) return this.points;
@@ -495,7 +603,7 @@ function findLatestTime(data) {
 }
 
 /* =====================================================
-   観測点（ブラウザ側と同じ処理）
+   観測点
    ===================================================== */
 
 function walkRecords(value, out = []) {
@@ -633,7 +741,6 @@ function decodeGif(buf) {
 
       lzwDecode(minCode, data, px);
 
-      /* 実際の行 → 展開後の行位置 */
       const rowPos = new Uint16Array(h);
 
       if (f & 0x40) {
